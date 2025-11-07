@@ -1,23 +1,77 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"html" // サニタイズのためにhtmlパッケージをインポート
 	"log"
 	"net/http"
+	"sync" // 排他制御のためにsyncパッケージをインポート
+
+	"github.com/google/uuid" // UUID生成のためにインポート
 )
 
+type Post struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Content string `json:"content"`
+}
+
+var (
+	posts []Post
+	mu    sync.RWMutex
+)
+
+func sanitize(s string) string {
+	return html.EscapeString(s)
+}
+
 func handleRoot(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprint(w, "掲示板APIへようこそ!")
+	fmt.Fprint(w, "掲示板APIへようこそ! /postsエンドポイントをご利用ください。")
 }
 
 func handlePosts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	switch r.Method {
 	case "GET":
-		fmt.Fprint(w, "ここは投稿一覧を返す場所です")
+		handleGetPosts(w, r)
 	case "POST":
-		fmt.Fprint(w, "ここは新しい投稿を作成する場所です")
+		handleCreatePost(w, r)
 	default:
-		http.Error(w, "許可されていないメソッドです", http.StatusMethodNotAllowed)
+		http.Error(w, `{"error": "許可されていないメソッドです"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+func handleGetPosts(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	if err := json.NewEncoder(w).Encode(posts); err != nil {
+		log.Printf("投稿一覧のJSONエンコードに失敗しました: %v", err)
+		http.Error(w, `{"error": "サーバー内部のエラー"}`, http.StatusInternalServerError)
+	}
+}
+
+func handleCreatePost(w http.ResponseWriter, r *http.Request) {
+	var newPost Post
+
+	if err := json.NewDecoder(r.Body).Decode(&newPost); err != nil {
+		http.Error(w, `{"error": "リクエストボディの形式が不正です"}`, http.StatusBadRequest)
+		return
+	}
+
+	newPost.ID = uuid.New().String()
+	newPost.Title = sanitize((newPost.Title))
+	newPost.Content = sanitize(newPost.Content)
+
+	mu.Lock()
+	posts = append(posts, newPost)
+	mu.Unlock()
+
+	w.WriteHeader(http.StatusCreated)
+	if err := json.NewEncoder(w).Encode(newPost); err != nil {
+		log.Printf("新規投稿のJSONエンコードに失敗しました: %v", err)
+		http.Error(w, `{"error": "サーバー内部のエラー"}`, http.StatusInternalServerError)
 	}
 }
 
