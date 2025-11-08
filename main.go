@@ -1,19 +1,20 @@
-// main is a simple API for a bulletin board.
-// It provides endpoints to get and create posts.
+// Command go-bbs-api is a simple RESTful API for a bulletin board.
+// It uses a pure Go SQLite driver to persist post data.
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"html" // Used for sanitizing user input.
+	"html" // Used for sanitizing user input to prevent XSS.
 	"log"
 	"net/http"
-	"sync" // Used for thread-safe access to the posts slice.
 
 	"github.com/google/uuid" // Used for generating unique IDs for new posts.
+	_ "modernc.org/sqlite"   // Pure Go SQLite driver, CGO-free.
 )
 
-// Post represents a single post on the bulletin board.
+// Post represents a single entry on the bulletin board.
 type Post struct {
 	ID      string `json:"id"`
 	Title   string `json:"title"`
@@ -21,33 +22,64 @@ type Post struct {
 }
 
 var (
-	// posts is a slice that stores all the posts in memory.
-	posts []Post
-	// mu is a RWMutex to ensure safe concurrent access to the posts slice.
-	mu sync.RWMutex
+	// db holds the application's database connection pool. It is initialized
+	// in main() and shared across all handlers.
+	db *sql.DB
 )
 
-// sanitize escapes a string to prevent XSS attacks.
+// createTable ensures the necessary database schema (the 'posts' table) exists.
+// It accepts a database connection pool and can be used for both the main application
+// and for setting up test databases.
+func createTable(db *sql.DB) {
+	createTableSQL := `CREATE TABLE IF NOT EXISTS posts (
+		"id" TEXT NOT NULL PRIMARY KEY,
+		"title" TEXT,
+		"content" TEXT
+	);`
+
+	_, err := db.Exec(createTableSQL)
+	if err != nil {
+		// Since this is a critical startup step, we terminate if it fails.
+		log.Fatalf("Failed to create table: %v", err)
+	}
+}
+
+// initDB now focuses solely on opening the main application's database file
+// and then calls createTable to set up the schema.
+func initDB() {
+	var err error
+	// The driver name "sqlite" is registered by the blank import of modernc.org/sqlite.
+	db, err = sql.Open("sqlite", "./bulletinboard.db")
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Call the separated function to create the table schema.
+	createTable(db)
+}
+
+// sanitize escapes potentially harmful characters from a string to prevent
+// Cross-Site Scripting (XSS) attacks.
 func sanitize(s string) string {
 	return html.EscapeString(s)
 }
 
 // handleRoot is the handler for the root ("/") endpoint.
-// It returns a welcome message.
+// It returns a simple welcome message.
 func handleRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	fmt.Fprint(w, "Welcome to the Bulletin Board API! Please use the /posts endpoint.")
 }
 
-// handlePosts is the handler for the "/posts" endpoint.
-// It dispatches requests to the appropriate handler based on the HTTP method.
+// handlePosts routes requests for the "/posts" endpoint based on the HTTP method.
+// It also handles CORS preflight (OPTIONS) requests.
 func handlePosts(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers to allow cross-origin requests.
+	// Set CORS headers to allow cross-origin requests from web browsers.
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-	// Handle preflight (OPTIONS) requests for CORS.
+	// Handle CORS preflight requests.
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
 		return
@@ -64,12 +96,29 @@ func handlePosts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleGetPosts handles GET requests to the "/posts" endpoint.
-// It retrieves and returns all posts as a JSON array.
+// handleGetPosts handles GET requests to "/posts". It retrieves all posts from
+// the database, ordered by creation time (descending), and returns them as a JSON array.
 func handleGetPosts(w http.ResponseWriter, r *http.Request) {
-	// Use a read lock to allow multiple concurrent reads.
-	mu.RLock()
-	defer mu.RUnlock()
+	// "rowid" is an implicit auto-incrementing column in SQLite. Ordering by it
+	// in descending order retrieves the most recent posts first.
+	rows, err := db.Query("SELECT id, title, content FROM posts ORDER BY rowid DESC")
+	if err != nil {
+		log.Printf("Failed to query posts from database: %v", err)
+		http.Error(w, `{"error": "Internal server error"}`, http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	posts := make([]Post, 0)
+	for rows.Next() {
+		var p Post
+		if err := rows.Scan(&p.ID, &p.Title, &p.Content); err != nil {
+			log.Printf("Failed to scan row: %v", err)
+			http.Error(w, `{"error": "Internal server error"}`, http.StatusInternalServerError)
+			return
+		}
+		posts = append(posts, p)
+	}
 
 	if err := json.NewEncoder(w).Encode(posts); err != nil {
 		log.Printf("Failed to encode posts to JSON: %v", err)
@@ -77,28 +126,39 @@ func handleGetPosts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleCreatePost handles POST requests to the "/posts" endpoint.
-// It creates a new post from the request body.
+// handleCreatePost handles POST requests to "/posts". It decodes a new post
+// from the request body, assigns a unique ID, sanitizes the input, and inserts
+// it into the database. It returns the newly created post as JSON.
 func handleCreatePost(w http.ResponseWriter, r *http.Request) {
 	var newPost Post
 
-	// Decode the JSON request body into a new Post struct.
 	if err := json.NewDecoder(r.Body).Decode(&newPost); err != nil {
 		http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
 		return
 	}
 
-	// Assign a new UUID and sanitize the input.
+	// Assign a new universally unique identifier (UUID).
 	newPost.ID = uuid.New().String()
-	newPost.Title = sanitize((newPost.Title))
+	// Sanitize user-provided title and content to prevent XSS.
+	newPost.Title = sanitize(newPost.Title)
 	newPost.Content = sanitize(newPost.Content)
 
-	// Use a write lock to ensure exclusive access when modifying the posts slice.
-	mu.Lock()
-	posts = append(posts, newPost)
-	mu.Unlock()
+	// Use a prepared statement to prevent SQL injection vulnerabilities.
+	stmt, err := db.Prepare("INSERT INTO posts(id, title, content) VALUES(?, ?, ?)")
+	if err != nil {
+		log.Printf("Failed to prepare statement: %v", err)
+		http.Error(w, `{"error": "Internal server error"}`, http.StatusInternalServerError)
+		return
+	}
+	defer stmt.Close()
 
-	// Respond with the newly created post.
+	_, err = stmt.Exec(newPost.ID, newPost.Title, newPost.Content)
+	if err != nil {
+		log.Printf("Failed to insert post into database: %v", err)
+		http.Error(w, `{"error": "Internal server error"}`, http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusCreated)
 	if err := json.NewEncoder(w).Encode(newPost); err != nil {
 		log.Printf("Failed to encode new post to JSON: %v", err)
@@ -107,10 +167,10 @@ func handleCreatePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Initialize with a sample post.
-	posts = []Post{
-		{"00000000-0000-0000-0000-000000000001", "Test Post 1", "This is the first post."},
-	}
+	// Initialize the database connection and table schema.
+	initDB()
+	// Ensure the database connection is closed when the application exits.
+	defer db.Close()
 
 	http.HandleFunc("/", handleRoot)
 	http.HandleFunc("/posts", handlePosts)

@@ -1,118 +1,136 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite" // Ensure the driver is imported for tests
 )
 
-// setupRouter initializes a new ServeMux and registers the application's handlers.
-// It returns the configured router for use in tests.
-func setupRouter() *http.ServeMux {
+func setupTestDB(t *testing.T) func() {
+	var err error
+	// Use ":memory:" to create a private, in-memory database for each test.
+	db, err = sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("Failed to open in-memory database: %v", err)
+	}
+
+	// Call the new, reusable createTable function directly.
+	// This correctly applies the schema to our in-memory database
+	// without touching the file-based one.
+	createTable(db)
+
+	// Return a teardown function to be called by the test.
+	teardown := func() {
+		db.Close()
+	}
+	return teardown
+}
+
+// TestGetEndpoints tests GET requests for the root and /posts endpoints.
+func TestGetEndpoints(t *testing.T) {
+	// Setup the test database and schedule its cleanup.
+	teardown := setupTestDB(t)
+	defer teardown()
+
+	// --- Pre-populate the database for the GET /posts test ---
+	// We add a known post to the database to verify that the endpoint can retrieve it.
+	stmt, err := db.Prepare("INSERT INTO posts(id, title, content) VALUES(?, ?, ?)")
+	if err != nil {
+		t.Fatalf("Failed to prepare statement: %v", err)
+	}
+	_, err = stmt.Exec("test-id-123", "Test Title", "Test Content")
+	if err != nil {
+		t.Fatalf("Failed to insert test data: %v", err)
+	}
+	stmt.Close()
+	// --- End of pre-population ---
+
 	router := http.NewServeMux()
 	router.HandleFunc("/", handleRoot)
 	router.HandleFunc("/posts", handlePosts)
-	return router
-}
 
-// setupTestEnvironment prepares the global state for a test run.
-// It initializes the 'posts' slice with a known set of data.
-func setupTestEnvironment() {
-	mu.Lock()
-	defer mu.Unlock()
-	posts = []Post{
-		{"00000000-0000-0000-0000-000000000001", "Test Post 1", "This is the first post."},
-	}
-}
+	t.Run("GET / returns welcome message", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
 
-// tearDownTestEnvironment cleans up the global state after a test run.
-// It resets the 'posts' slice to nil to ensure test isolation.
-func tearDownTestEnvironment() {
-	mu.Lock()
-	defer mu.Unlock()
-	posts = nil
-}
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected status %d, got %d", http.StatusOK, rec.Code)
+		}
+		expectedBody := "Welcome to the Bulletin Board API! Please use the /posts endpoint."
+		if rec.Body.String() != expectedBody {
+			t.Errorf("expected body %q, got %q", expectedBody, rec.Body.String())
+		}
+	})
 
-// TestEndpoints uses subtests to test the application's HTTP endpoints.
-func TestEndpoints(t *testing.T) {
-	// Set up the environment once for all subtests in this function.
-	setupTestEnvironment()
-	defer tearDownTestEnvironment()
+	t.Run("GET /posts returns list of posts", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/posts", nil)
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
 
-	router := setupRouter()
+		if rec.Code != http.StatusOK {
+			t.Errorf("expected status %d, got %d", http.StatusOK, rec.Code)
+		}
 
-	// Define test cases as a table to keep the code DRY (Don't Repeat Yourself).
-	testCases := []struct {
-		name           string
-		method         string
-		path           string
-		expectedStatus int
-		expectedBody   string
-	}{
-		{
-			name:           "GET / returns the welcome message",
-			method:         http.MethodGet,
-			path:           "/",
-			expectedStatus: http.StatusOK,
-			expectedBody:   "Welcome to the Bulletin Board API! Please use the /posts endpoint.",
-		},
-		{
-			name:           "GET /posts returns the list of posts",
-			method:         http.MethodGet,
-			path:           "/posts",
-			expectedStatus: http.StatusOK,
-			expectedBody:   `[{"id":"00000000-0000-0000-0000-000000000001","title":"Test Post 1","content":"This is the first post."}]`,
-		},
-	}
+		// Check the JSON response.
+		var posts []Post
+		if err := json.Unmarshal(rec.Body.Bytes(), &posts); err != nil {
+			t.Fatalf("Failed to unmarshal response body: %v", err)
+		}
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(tc.method, tc.path, nil)
-			rec := httptest.NewRecorder()
-			router.ServeHTTP(rec, req)
-
-			// Check the status code.
-			if rec.Code != tc.expectedStatus {
-				t.Errorf("expected status code %d, but got %d", tc.expectedStatus, rec.Code)
-			}
-
-			// Check the response body.
-			// Using strings.TrimSpace to handle potential trailing newlines from json.Encoder.
-			if strings.TrimSpace(rec.Body.String()) != tc.expectedBody {
-				t.Errorf("expected body %q, but got %q", tc.expectedBody, rec.Body.String())
-			}
-		})
-	}
+		if len(posts) != 1 {
+			t.Fatalf("expected 1 post, but got %d", len(posts))
+		}
+		if posts[0].Title != "Test Title" {
+			t.Errorf("expected post title to be 'Test Title', but got %s", posts[0].Title)
+		}
+	})
 }
 
 // TestCreatePostEndpoint tests the POST /posts functionality.
 func TestCreatePostEndpoint(t *testing.T) {
-	// This test needs a clean slate, so we manage the environment inside it.
-	tearDownTestEnvironment() // Clean up before test
-	defer tearDownTestEnvironment()
+	// Setup a clean, empty database for this specific test.
+	teardown := setupTestDB(t)
+	defer teardown()
 
-	router := setupRouter()
+	router := http.NewServeMux()
+	router.HandleFunc("/posts", handlePosts)
 
-	t.Run("POST /posts creates a new post", func(t *testing.T) {
-		postJSON := `{"title": "New Title", "content": "New Content"}`
-		req := httptest.NewRequest(http.MethodPost, "/posts", strings.NewReader(postJSON))
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
+	postJSON := `{"title": "New Title", "content": "New Content"}`
+	req := httptest.NewRequest(http.MethodPost, "/posts", strings.NewReader(postJSON))
+	rec := httptest.NewRecorder()
 
-		// Check status code.
-		if rec.Code != http.StatusCreated {
-			t.Errorf("expected status code %d, but got %d", http.StatusCreated, rec.Code)
-		}
+	router.ServeHTTP(rec, req)
 
-		// Check if the post was actually added.
-		mu.RLock()
-		if len(posts) != 1 {
-			t.Errorf("expected 1 post to be created, but found %d", len(posts))
-		}
-		if posts[0].Title != "New Title" {
-			t.Errorf("expected new post title to be 'New Title', but got %s", posts[0].Title)
-		}
-		mu.RUnlock()
-	})
+	// 1. Check the HTTP response
+	if rec.Code != http.StatusCreated {
+		t.Errorf("expected status %d, got %d", http.StatusCreated, rec.Code)
+	}
+
+	// 2. Verify the response body contains the created post
+	var createdPost Post
+	if err := json.Unmarshal(rec.Body.Bytes(), &createdPost); err != nil {
+		t.Fatalf("Failed to unmarshal response body: %v", err)
+	}
+	if createdPost.Title != "New Title" {
+		t.Errorf("expected created post title to be 'New Title', but got %s", createdPost.Title)
+	}
+	if createdPost.ID == "" {
+		t.Error("expected created post to have a non-empty ID")
+	}
+
+	// 3. Verify the data was actually written to the database
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM posts WHERE title = ?", "New Title").Scan(&count)
+	if err != nil {
+		t.Fatalf("Failed to query database for new post: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected database to have 1 post with the new title, but found %d", count)
+	}
 }
