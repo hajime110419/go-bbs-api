@@ -27,10 +27,20 @@ func sanitize(s string) string {
 }
 
 func handleRoot(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
 	fmt.Fprint(w, "掲示板APIへようこそ! /postsエンドポイントをご利用ください。")
 }
 
 func handlePosts(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	switch r.Method {
 	case "GET":
@@ -76,6 +86,10 @@ func handleCreatePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	posts = []Post{
+		{"00000000-0000-0000-0000-000000000001", "テスト投稿1", "これは最初の投稿です。"},
+	}
+
 	http.HandleFunc("/", handleRoot)
 	http.HandleFunc("/posts", handlePosts)
 
