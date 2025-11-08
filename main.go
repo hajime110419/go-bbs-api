@@ -11,7 +11,8 @@ import (
 	"net/http"
 
 	"github.com/google/uuid" // Used for generating unique IDs for new posts.
-	_ "modernc.org/sqlite"   // Pure Go SQLite driver, CGO-free.
+	"github.com/juju/ratelimit"
+	_ "modernc.org/sqlite" // Pure Go SQLite driver, CGO-free.
 )
 
 // Post represents a single entry on the bulletin board.
@@ -62,6 +63,25 @@ func initDB() {
 // Cross-Site Scripting (XSS) attacks.
 func sanitize(s string) string {
 	return html.EscapeString(s)
+}
+
+// rateLimiterMiddleware returns an HTTP middleware that applies a rate limit
+// using the juju/ratelimit token bucket.
+func rateLimiterMiddleware(bucket *ratelimit.Bucket) func(http.HandlerFunc) http.HandlerFunc {
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			// Check if a token is available. TakeAvailable(1) attempts to consume 1 token
+			// immediately and returns 0 if none are avaliable.
+			if bucket.TakeAvailable(1) == 0 {
+				// If rate limit is exceeded, return 429 Too Many Requests.
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				http.Error(w, `{"error": "Too many requests. Please try again later."}`, http.StatusTooManyRequests)
+				return
+			}
+			// If a token is consumed, proceed to the next handler.
+			next(w, r)
+		}
+	}
 }
 
 // handleRoot is the handler for the root ("/") endpoint.
@@ -172,8 +192,15 @@ func main() {
 	// Ensure the database connection is closed when the application exits.
 	defer db.Close()
 
+	rate := 2.0
+	capacity := int64(2)
+
+	limiterBucket := ratelimit.NewBucketWithRate(rate, capacity)
+
+	limitedHandler := rateLimiterMiddleware(limiterBucket)(handlePosts)
+
 	http.HandleFunc("/", handleRoot)
-	http.HandleFunc("/posts", handlePosts)
+	http.HandleFunc("/posts", limitedHandler)
 
 	port := ":8080"
 	fmt.Printf("Starting server on port %s…\n", port)
