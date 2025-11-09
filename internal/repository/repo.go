@@ -7,11 +7,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-var (
-	// db holds the application's database connection pool. It is initialized
-	db *sql.DB
-)
-
 // CreateTable ensures the necessary database schema (the 'posts' table) exists.
 // It accepts a database connection pool and can be used for both the main application
 // and for setting up test databases.
@@ -31,14 +26,17 @@ func CreateTable(db *sql.DB) {
 
 // InitDB now focuses solely on opening the main application's database file
 // and then calls CreateTable to set up the schema.
-func InitDB() {
+// It returns the database connection so it can be used throughout the application.
+func InitDB() *sql.DB {
 	var err error
 	// The driver name "sqlite" is registered by the blank import of modernc.org/sqlite.
-	db, err = sql.Open("sqlite", "./bulletinboard.db")
+	db, err := sql.Open("sqlite", "./bulletinboard.db")
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
 
 	// Call the separated function to create the table schema.
 	CreateTable(db)
+
+	return db
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/hajime110419/go-bbs-api/internal/handler"
 	"github.com/hajime110419/go-bbs-api/internal/models"
 	"github.com/hajime110419/go-bbs-api/internal/repository"
+	"github.com/hajime110419/go-bbs-api/internal/service"
 	_ "modernc.org/sqlite" // Ensure the driver is imported for tests
 )
 
@@ -56,7 +57,8 @@ func TestGetEndpoints(t *testing.T) {
 	// --- End of pre-population ---
 
 	router := http.NewServeMux()
-	h := &handler.PostHandler{DB: db}
+	postService := service.NewPostService(db)
+	h := handler.NewPostHandler(postService)
 	router.HandleFunc("/", h.HandleRoot)
 	router.HandleFunc("/posts", h.HandlePosts)
 
@@ -105,7 +107,8 @@ func TestCreatePostEndpoint(t *testing.T) {
 	defer teardown()
 
 	router := http.NewServeMux()
-	h := &handler.PostHandler{DB: db}
+	postService := service.NewPostService(db)
+	h := handler.NewPostHandler(postService)
 	router.HandleFunc("/posts", h.HandlePosts)
 
 	postJSON := `{"title": "New Title", "content": "New Content"}`

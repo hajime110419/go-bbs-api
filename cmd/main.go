@@ -11,6 +11,7 @@ import (
 	"github.com/hajime110419/go-bbs-api/internal/handler"
 	"github.com/hajime110419/go-bbs-api/internal/middleware"
 	"github.com/hajime110419/go-bbs-api/internal/repository"
+	"github.com/hajime110419/go-bbs-api/internal/service"
 	"github.com/juju/ratelimit"
 )
 
@@ -20,11 +21,15 @@ var (
 
 func main() {
 	// Initialize the database connection and table schema.
-	repository.InitDB()
+	db = repository.InitDB()
 	// Ensure the database connection is closed when the application exits.
 	defer db.Close()
 
-	h := &handler.PostHandler{DB: db}
+	// Initialize the service layer with the database connection.
+	postService := service.NewPostService(db)
+
+	// Initialize the handler with the service -> presentation layer
+	h := handler.NewPostHandler(postService)
 
 	rate := 2.0
 	capacity := int64(2)
@@ -33,7 +38,7 @@ func main() {
 
 	limitedHandler := middleware.RateLimiterMiddleware(limiterBucket)(h.HandlePosts)
 
-	http.HandleFunc("/", h.HandlePosts)
+	http.HandleFunc("/", h.HandleRoot)
 	http.HandleFunc("/posts", limitedHandler)
 
 	port := ":8080"
